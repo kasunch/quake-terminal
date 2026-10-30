@@ -656,6 +656,39 @@ export const QuakeMode = class {
   }
 
   /**
+   * @param {Meta.Window} window - A window owned by our Wayland client.
+   */
+  _showInWindowList(window) {
+    // @ts-ignore
+    if (window.show_in_window_list) {
+      // @ts-ignore
+      window.show_in_window_list();
+      return;
+    }
+
+    // @ts-ignore
+    this._waylandClient.show_in_window_list(window);
+  }
+
+  /**
+   * Mutter refuses to minimize a window hidden from the window list, since
+   * nothing could restore it. Put it back in the list just long enough to
+   * minimize it; the dock redraws later, so it doesn't see the change.
+   */
+  _minimizeTerminalWindow() {
+    const window = this.terminalWindow;
+
+    if (!this._waylandClient) {
+      window.minimize();
+      return;
+    }
+
+    this._showInWindowList(window);
+    window.minimize();
+    this._hideFromWindowList(window);
+  }
+
+  /**
    * Adjusts the terminal window's initial position and handles signal connections related
    * to window mapping and sizing.
    *
@@ -848,7 +881,7 @@ export const QuakeMode = class {
       onStopped: () => clearClip(),
       onComplete: () => {
         Main.wm.skipNextEffect(this.actor);
-        this.actor.meta_window.minimize();
+        this._minimizeTerminalWindow();
         this.actor.translation_y = 0;
       },
     });
