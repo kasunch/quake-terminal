@@ -112,8 +112,17 @@ export const QuakeMode = class {
     this._terminalWindowFocusId = null;
     this._wmMapSignalId = null;
     this._terminalChangedId = null;
+    this._windowCreatedId = null;
     this._actorStageViewChangedId = null;
     this._clearAnimationClip = null;
+
+    /**
+     * Set when the terminal is launched as a private Wayland client, which
+     * lets us tell which windows belong to it and hide them from the dock.
+     *
+     * @type {Meta.WaylandClient}
+     */
+    this._waylandClient = null;
 
     /**
      *@type {Meta.Window}
@@ -343,6 +352,11 @@ export const QuakeMode = class {
       this._terminalChangedId = null;
     }
 
+    if (this._windowCreatedId) {
+      Shell.Global.get().display.disconnect(this._windowCreatedId);
+      this._windowCreatedId = null;
+    }
+
     if (this._terminalWindowFocusId) {
       Shell.Global.get().display.disconnect(this._terminalWindowFocusId);
       this._terminalWindowFocusId = null;
@@ -356,6 +370,7 @@ export const QuakeMode = class {
     this._settingsWatchingListIds = [];
     this._terminal = null;
     this._terminalWindow = null;
+    this._waylandClient = null;
     this._internalState = QuakeMode.LIFECYCLE.DEAD;
     this._isTaskbarConfigured = null;
     // @ts-ignore
@@ -429,8 +444,35 @@ export const QuakeMode = class {
     const launchArgs = launchArgsMap[info.get_id()] || "";
     const cancellable = new Gio.Cancellable();
 
+    const usePrivateLaunch = this._usePrivateLaunch();
+
     const promiseTerminalWindowInLessThanFiveSeconds = new Promise(
       (resolve, reject) => {
+        const windowCreatedHandler = (
+          /** @type {Meta.Display} */ display,
+          /** @type {Meta.Window} */ window
+        ) => {
+          if (!this._waylandClient?.owns_window(window)) {
+            return;
+          }
+
+          display.disconnect(this._windowCreatedId);
+          this._windowCreatedId = null;
+          GLib.Source.remove(this._sourceTimeoutLoopId);
+          this._sourceTimeoutLoopId = null;
+
+          if (this._internalState !== QuakeMode.LIFECYCLE.STARTING) {
+            return;
+          }
+
+          // Unlike the skip_taskbar override, this marks the window inside
+          // Mutter, so GNOME doesn't count the terminal as a running app and
+          // the dock shows no icon for it.
+          this._hideFromWindowList(window);
+          this._setupTerminalWindow(window);
+          resolve(true);
+        };
+
         const shellAppWindowsChangedHandler = () => {
           GLib.Source.remove(this._sourceTimeoutLoopId);
           this._sourceTimeoutLoopId = null;
@@ -460,46 +502,21 @@ export const QuakeMode = class {
             );
           }
 
-          const ourWindow = this._terminal.get_windows()[0];
-          /**
-           * The window actor for this terminal window.
-           *
-           * @type {Meta.WindowActor & { ease: Function }}
-           */
-          const actor = ourWindow.get_compositor_private();
-          actor.set_name("quake-terminal");
-          this._terminalWindow = ourWindow;
-          this._internalState = QuakeMode.LIFECYCLE.CREATED_ACTOR;
-
-          // Keeps the Terminal out of Overview mode and Alt-Tab window switching
-          this._configureSkipTaskbarProperty();
-
-          this._handleAlwaysOnTop();
-
-          this._terminalWindowUnmanagedId = this.terminalWindow.connect(
-            "unmanaged",
-            () => {
-              _log(`*** QuakeTerminal@Unmanaged Called unmanaged ***`);
-              this.destroy();
-            }
-          );
-
-          this._terminalWindowFocusId = Shell.Global.get().display.connect(
-            "notify::focus-window",
-            (source) => {
-              this._handleHideOnFocusLoss(source).catch((e) =>
-                _log(`*** QuakeTerminal@focus-window - ${e} ***`)
-              );
-            }
-          );
-
+          this._setupTerminalWindow(this._terminal.get_windows()[0]);
           resolve(true);
         };
 
-        this._terminalChangedId = this._terminal.connect(
-          "windows-changed",
-          shellAppWindowsChangedHandler
-        );
+        if (usePrivateLaunch) {
+          this._windowCreatedId = Shell.Global.get().display.connect(
+            "window-created",
+            windowCreatedHandler
+          );
+        } else {
+          this._terminalChangedId = this._terminal.connect(
+            "windows-changed",
+            shellAppWindowsChangedHandler
+          );
+        }
 
         const exec = info.get_string("Exec");
         const cleanedExec = this._cleanDesktopFileExec(exec);
@@ -533,6 +550,109 @@ export const QuakeMode = class {
     );
 
     return promiseTerminalWindowInLessThanFiveSeconds;
+  }
+
+  /**
+   * Adopts a newly launched window as the quake terminal and connects the
+   * window signals it needs.
+   *
+   * @param {Meta.Window} ourWindow - The terminal's first window.
+   */
+  _setupTerminalWindow(ourWindow) {
+    /**
+     * The window actor for this terminal window.
+     *
+     * @type {Meta.WindowActor & { ease: Function }}
+     */
+    const actor = ourWindow.get_compositor_private();
+    actor.set_name("quake-terminal");
+    this._terminalWindow = ourWindow;
+    this._internalState = QuakeMode.LIFECYCLE.CREATED_ACTOR;
+
+    // Keeps the Terminal out of Overview mode and Alt-Tab window switching
+    this._configureSkipTaskbarProperty();
+
+    this._handleAlwaysOnTop();
+
+    this._terminalWindowUnmanagedId = this.terminalWindow.connect(
+      "unmanaged",
+      () => {
+        _log(`*** QuakeTerminal@Unmanaged Called unmanaged ***`);
+        this.destroy();
+      }
+    );
+
+    this._terminalWindowFocusId = Shell.Global.get().display.connect(
+      "notify::focus-window",
+      (source) => {
+        this._handleHideOnFocusLoss(source).catch((e) =>
+          _log(`*** QuakeTerminal@focus-window - ${e} ***`)
+        );
+      }
+    );
+  }
+
+  /**
+   * On Wayland, a terminal we launch ourselves through Meta.WaylandClient can
+   * be hidden from the window list, which also keeps it out of the dock.
+   *
+   * @returns {boolean} True when the terminal should be launched privately.
+   */
+  _usePrivateLaunch() {
+    const isWayland = SHELL_VERSION >= 50 || Meta.is_wayland_compositor();
+    return isWayland && this._settings.get_boolean("skip-taskbar");
+  }
+
+  /**
+   * Launches argv as a Wayland client owned by the shell. Newer Mutter
+   * versions replaced `new()` + `spawnv()` with `new_subprocess()`, and older
+   * ones take no context parameter in `new()`.
+   *
+   * @param {string[]} argv - The command line to run.
+   * @returns {Gio.Subprocess} The running process.
+   */
+  _spawnWaylandClient(argv) {
+    const global = Shell.Global.get();
+    const launcher = new Gio.SubprocessLauncher({
+      flags: Gio.SubprocessFlags.NONE,
+    });
+
+    // @ts-ignore
+    if (Meta.WaylandClient.new_subprocess) {
+      // @ts-ignore
+      this._waylandClient = Meta.WaylandClient.new_subprocess(
+        global.context,
+        launcher,
+        argv
+      );
+      // @ts-ignore
+      return this._waylandClient.get_subprocess();
+    }
+
+    // @ts-ignore
+    this._waylandClient =
+      Meta.WaylandClient.new.length === 1
+        ? // @ts-ignore
+          Meta.WaylandClient.new(launcher)
+        : // @ts-ignore
+          Meta.WaylandClient.new(global.context, launcher);
+    // @ts-ignore
+    return this._waylandClient.spawnv(global.display, argv);
+  }
+
+  /**
+   * @param {Meta.Window} window - A window owned by our Wayland client.
+   */
+  _hideFromWindowList(window) {
+    // @ts-ignore
+    if (window.hide_from_window_list) {
+      // @ts-ignore
+      window.hide_from_window_list();
+      return;
+    }
+
+    // @ts-ignore
+    this._waylandClient.hide_from_window_list(window);
   }
 
   /**
@@ -967,11 +1087,17 @@ export const QuakeMode = class {
    */
   async _spawn(argv, cancellable = null) {
     let cancelId = 0;
-    const proc = new Gio.Subprocess({
-      argv,
-      flags: Gio.SubprocessFlags.NONE,
-    });
-    proc.init(cancellable);
+    let proc;
+
+    if (this._usePrivateLaunch()) {
+      proc = this._spawnWaylandClient(argv);
+    } else {
+      proc = new Gio.Subprocess({
+        argv,
+        flags: Gio.SubprocessFlags.NONE,
+      });
+      proc.init(cancellable);
+    }
 
     if (cancellable instanceof Gio.Cancellable)
       cancelId = cancellable.connect(() => proc.force_exit());
