@@ -855,6 +855,7 @@ export const QuakeMode = class {
 
     Main.wm.skipNextEffect(this.actor);
     Main.activateWindow(this.actor.meta_window);
+    this._handleAlwaysOnTop();
 
     this.actor.ease({
       mode: Clutter.AnimationMode.EASE_IN_QUAD,
@@ -881,6 +882,7 @@ export const QuakeMode = class {
       onStopped: () => clearClip(),
       onComplete: () => {
         Main.wm.skipNextEffect(this.actor);
+        this._unsetAlwaysOnTop();
         this._minimizeTerminalWindow();
         this.actor.translation_y = 0;
       },
@@ -1094,19 +1096,36 @@ export const QuakeMode = class {
     this._hideTerminalWithAnimationBottomUp();
   }
 
+  /**
+   * Applies the always-on-top preference to the terminal window. A hidden
+   * (minimized) terminal is never made "above"; it gets the flag back the
+   * next time it is shown.
+   */
   _handleAlwaysOnTop() {
     const shouldAlwaysOnTop = this._settings.get_boolean("always-on-top");
 
-    if (!shouldAlwaysOnTop && !this.terminalWindow.is_above()) {
+    if (!shouldAlwaysOnTop || this.terminalWindow.minimized) {
+      this._unsetAlwaysOnTop();
       return;
     }
 
-    if (!shouldAlwaysOnTop && this.terminalWindow.is_above()) {
+    if (!this.terminalWindow.is_above()) {
+      this.terminalWindow.make_above();
+    }
+  }
+
+  /**
+   * Drops the "above" state from the terminal window. Mutter's
+   * window_would_be_covered() treats every "above" window on the workspace as
+   * covering a new window, even when it is minimized, so a hidden but
+   * always-on-top terminal (sticky, so on every workspace) would keep new
+   * windows of other apps from taking focus, showing a "Window is ready"
+   * notification instead.
+   */
+  _unsetAlwaysOnTop() {
+    if (this.terminalWindow.is_above()) {
       this.terminalWindow.unmake_above();
-      return;
     }
-
-    this.terminalWindow.make_above();
   }
 
   /**
